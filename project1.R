@@ -4,18 +4,30 @@ library(ucimlrepo)
 library(fastDummies)
 library(CCP)
 library(nnet)
-#cp, restecg, thal
+library(bnlearn)
+library(graph)
+library(pcalg)
+library(MatchIt)
+library(cobalt)
+library(igraph)
+library(ggraph)
+library(gridExtra)
 
+if (!require("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+BiocManager::install("graph")
 
 iris_by_name <- fetch_ucirepo(name = "Heart Disease")
 data = iris_by_name[["data"]][["original"]]
 
 df <- as.data.frame(data)
+
 # Specify data types
 df$sex <- factor(df$sex, 
-                levels = c(0,1), 
-                labels = c("female", "male"))
-##maybe ordinal
+                 levels = c(0,1), 
+                 labels = c("female", "male"))
+
 df$cp <- factor(df$cp, levels = c(1, 2, 3, 4), labels = c("typical angina", "atypical angina", "non-anginal pain", "asymptomatic"))
 
 df$fbs <- factor(df$fbs, 
@@ -23,251 +35,163 @@ df$fbs <- factor(df$fbs,
                  labels = c("fbs <= 120", "fbs > 120"))
 
 df$restecg <- factor(df$restecg, 
-                 levels = c(0,1,2), 
-                 labels = c("normal", "ST-T wave abnormality", "left ventricular hypertrophy"))
+                     levels = c(0,1,2), 
+                     labels = c("normal", "ST-T wave abnormality", "left ventricular hypertrophy"))
 
 df$exang <- factor(df$exang, 
-                     levels = c(0,1), 
-                     labels = c("no", "yes"))
+                   levels = c(0,1), 
+                   labels = c("no", "yes"))
 
 df$slope <- factor(df$slope, 
-                     levels = c(1,2,3), 
-                     labels = c("upsloping", "flat", "downsloping"))
+                   levels = c(1,2,3), 
+                   labels = c("upsloping", "flat", "downsloping"))
 
 df$thal <- factor(df$thal, 
-                     levels = c(3,6,7), 
-                     labels = c("normal", "fixed defect", "reversible defect"))
+                  levels = c(3,6,7), 
+                  labels = c("normal", "fixed defect", "reversible defect"))
 
 df$num <- ifelse(df$num > 0, 1, 0)
 
-# Optional: Label the binary variable for clarity
 df$num <- factor(df$num, 
                  levels = c(0, 1), 
                  labels = c("No Heart Disease", "Heart Disease"))
 
-#df$num <- ordered(df$num, 
-#                  levels = c(0,1,2,3,4), 
-#                  labels = c("No Heart Disease", "Heart Disease - Level 1", 
-#                                      "Heart Disease - Level 2", "Heart Disease - Level 3", 
-#                                      "Heart Disease - Level 4"))
+df$ca <- factor(df$ca, 
+                levels = c(0,1,2,3), 
+                labels = c("0", "1", "2", "3"))
 
+df$age <- as.numeric(df$age)
+df$trestbps <- as.numeric(df$trestbps)
+df$chol <- as.numeric(df$chol)
+df$thalach <- as.numeric(df$thalach)
 
-##remove rows containing missing values
+#changed oldpeak from numerical to categorical because it is highly scewed 
+df$oldpeak_ord <- cut(df$oldpeak,
+                       breaks = c(-Inf, 1, 2, 3, Inf),
+                       labels = c("No depression", "Low depression", "Moderate depression", "High depression"),
+                      right = TRUE)
+#
+# # Convert the new variable to a factor
+df$oldpeak_ord <- factor(df$oldpeak_ord,
+                          levels = c("No depression", "Low depression", "Moderate depression", "High depression"),
+                          ordered = TRUE)
+
+# Keep oldpeak intact without introducing NA
+df <- df[, !(names(df) %in% c("oldpeak"))]
+
+# Check the cleaned dataset
+nrow(df)  # Check the new size of the dataset
 df <- na.omit(df)
+#
+variables <- colnames(df)
+from_vars <- setdiff(variables, c("sex", "age"))
 
-g <- dagitty('
-dag {
-bb="0,0,1,1"
-age [pos="0.7,0.1"]         
-sex [pos="0.2,0.15"]          
-cp [pos="0.55,0.5"]          
-trestbps [pos="0.4,0.8"]     
-chol [pos="0.2,0.2"]         
-fbs [pos="0.35,0.4"]        
-restecg [pos="0.45,0.3"]     
-thalach [pos="0.85,0.5"]    
-exang [pos="0.75,0.35"]      
-oldpeak [pos="0.5,0.4"]     
-slope [pos="0.5,0.55"]       
-ca [pos="0.4,0.2"]           
-thal [pos="0.9,0.4"]         
-num [pos="0.7,0.7"]          
-age -> { cp trestbps chol fbs thalach ca}
-sex -> { chol fbs restecg }
-trestbps -> { cp restecg }
-chol -> { restecg thalach trestbps num}
-fbs -> { slope oldpeak trestbps}
-slope -> { cp exang oldpeak }
-ca -> { exang oldpeak }
-thal -> { num }
-thalach -> {restecg oldpeak}
-exang -> {cp}
-num -> {ca cp restecg thalach}
-}
-')
-plot(g)
+#whitelist
+whitelist_combined <- data.frame(
+  from = c("num", "num"),
+  to = c("thalach", "cp")
+)
 
-addEdge <- function(g, from, to) {
-  # Extract the current graph definition
-  graph_string <- as.character(g)
-  updated_graph_string <- sub("\\}", paste0(from, " -> ", to, "\n}"), graph_string)
-  g = dagitty(updated_graph_string)
-  return(g)
-}
+no_incoming_edges <- data.frame(
+  from = rep(variables, each = 2),  # All other variables
+  to = c("sex", "age")              # No incoming edges to sex and age
+)
+no_incoming_edges <- no_incoming_edges[no_incoming_edges$from != no_incoming_edges$to, ]
+test_vars <- c("thal", "restecg", "ca", "thalach", "oldpeak_ord")  # Test variables
+no_outgoing_edges <- data.frame(
+  from = rep(test_vars, each = length(variables)),
+  to = variables
+)
+no_outgoing_edges <- no_outgoing_edges[no_outgoing_edges$from != no_outgoing_edges$to, ]
+blacklist <- rbind(no_incoming_edges, no_outgoing_edges)
 
-g <- graphLayout(g)
-impliedConditionalIndependencies(g)
-r <- localTests(g,df, type='cis.pillai')
-plotLocalTestResults(r)
-print(mean(abs(r$estimate)))
+hc_learned <- pc.stable(df, whitelist = whitelist_combined, blacklist = blacklist, alpha = 0.05, undirected = FALSE)
 
-#thalach -> slope
-g <- addEdge( g, "thalach", "slope")
-g <- graphLayout(g)
-impliedConditionalIndependencies(g)
-r <- localTests(g,df, type='cis.pillai')
-plotLocalTestResults(r)
-print(mean(abs(r$estimate)))
+plot(hc_learned)
+ig <- as.igraph(hc_learned)
 
-if (isAcyclic(g)) {
-  cat("The graph is acyclic (DAG). No cycles detected.\n")
-} else {
-  cat("The graph contains cycles. It is not a valid DAG.\n")
-}
+ggraph(ig, layout = "fr") +  
+  geom_edge_link(arrow = arrow(length = unit(5, "mm"), type = "closed"), 
+                 end_cap = circle(4, "mm"), 
+                 color = "grey") +
+  geom_node_point(size = 5, color = "skyblue") +
+  geom_node_label(aes(label = name), repel = FALSE) +
+  theme_void() +
+  ggtitle("")
 
-#sex -> thal
-g <- addEdge(g, "sex", "thal")
-g <- graphLayout(g)
-impliedConditionalIndependencies(g)
-r <- localTests(g,df, type='cis.pillai')
-plotLocalTestResults(r)
-print(mean(abs(r$estimate)))
+ci.test("num", "cp", data=df, test="x2")
 
-if (isAcyclic(g)) {
-  cat("The graph is acyclic (DAG). No cycles detected.\n")
-} else {
-  cat("The graph contains cycles. It is not a valid DAG.\n")
-}
+#check assumptions (normally distributed) for all continuous vars on all levels of parent cat. or ord. var
+# Plot histogram for 'thalach' conditioned on 'num'
+ggplot(df, aes(x = thalach, fill = num)) +
+  geom_histogram(bins = 30, alpha = 0.7, position = "identity") +
+  facet_wrap(~ num) +
+  theme_minimal() +
+  labs(title = "",
+       x = "thalach",
+       y = "Frequency")
 
-#num -> exang
-g <- addEdge(g, "num", "exang")
-g <- graphLayout(g)
-impliedConditionalIndependencies(g)
-r <- localTests(g,df, type='cis.pillai')
-plotLocalTestResults(r)
-print(mean(abs(r$estimate)))
+#same for chol given sex 
+ggplot(df, aes(x = chol, fill = sex)) +
+  geom_histogram(bins = 30, alpha = 0.7, position = "identity") +
+  facet_wrap(~ sex) +
+  theme_minimal() +
+  labs(title = "",
+       x = "chol",
+       y = "Frequency")
 
-if (isAcyclic(g)) {
-  cat("The graph is acyclic (DAG). No cycles detected.\n")
-} else {
-  cat("The graph contains cycles. It is not a valid DAG.\n")
-}
+#for continuous vars without cat parents:
+continuous_vars <- c("thalach", "age", "trestbps", "chol")
+hist_plots <- lapply(continuous_vars, function(var) {
+  ggplot(df, aes_string(x = var)) +
+    geom_histogram(bins = 20, fill = "skyblue", color = "black", alpha = 0.7) +
+    theme_minimal() +
+    labs(title = paste("Histogram of", var), x = var, y = "Frequency")
+})
 
-# num -> oldpeak
-g <- addEdge(g, "num", "oldpeak")
-g <- graphLayout(g)
-impliedConditionalIndependencies(g)
-r <- localTests(g,df, type='cis.pillai')
-plotLocalTestResults(r)
-print(mean(abs(r$estimate)))
+# Combine all histograms into one plot
+grid.arrange(grobs = hist_plots, ncol = 2)
 
-if (isAcyclic(g)) {
-  cat("The graph is acyclic (DAG). No cycles detected.\n")
-} else {
-  cat("The graph contains cycles. It is not a valid DAG.\n")
-}
+#note: fbs <= 120 = 244 entries vs 38 for >= 120
+fbs_frequency <- table(df$fbs)
+restecg_frequency <- table(df$restecg)
 
-# age -> num
-g <- addEdge(g, "age", "num")
-g <- graphLayout(g)
-impliedConditionalIndependencies(g)
-r <- localTests(g,df, type='cis.pillai')
-plotLocalTestResults(r)
-print(mean(abs(r$estimate)))
+#compute adjustment sets
+adjustmentSets(hc_learned,"num","cp")
 
-if (isAcyclic(g)) {
-  cat("The graph is acyclic (DAG). No cycles detected.\n")
-} else {
-  cat("The graph contains cycles. It is not a valid DAG.\n")
-}
+#linear regression
+model_lr <- lm(thalach ~ num, data = df)  # Adjust as per identified confounders
+summary(model_lr)
 
-##cannonical correlations
-r <- c()
-for( n in names(g) ){
-  for( p in dagitty::parents(g,n) ){
-    otherparents <- setdiff( dagitty::parents(g,n), p )
-    tst <- ciTest( X=n, Y=p, Z=otherparents, df,
-                   type="cis.pillai" )
-    r <- rbind( r, data.frame(list(X=p,A="->",Y=n,
-                                   cor=tst[,"estimate"],p=tst[,"p.value"])) )
-  }
-}
+# Unadjusted linear regression model BASELINE
+baseline_model <- lm(thalach ~ num, data = df)
+summary(baseline_model)
 
-r.dagitty <- paste(r$X, r$A, r$Y, "[beta=",signif(r$cor,2),"] ", collapse="\n")
-g_with_coefficients <- dagitty( r.dagitty )
-coordinates( g_with_coefficients ) <- coordinates( g )
-plot( g_with_coefficients, show.coefficients=TRUE )
+#with confounders LR (Hand-crafted model)
+model_lr <- lm(thalach ~ num + age + chol, data = df)  
+summary(model_lr)
 
-#filtered_r <- r[r$p <= 0.05 & r$cor > 0.01,]
-#r_del <- r[r$p > 0.05 | r$cor <= 0.01,]
+#without confounders LR (Structure Learned)
+model_lr <- lm(thalach ~ num, data = df)  
+summary(model_lr)
 
-#filtered_r_p <- r[r$p <= 0.05,]
-#r_del_p <- r[r$p > 0.05,]
-#length(filtered_r_p$X)
-#length(r_del_p$X)
+#propensity score matching for data given graph from assignment 1 
+#Without Confounders PSM (Hand-crafted model)
+ps_model <- glm(num ~ thalach, data = df, family = binomial(link = "logit"))
+df$propensity_score <- predict(ps_model, type = "response")
+matched_data <- matchit(num ~ age + chol, data = df, method = "nearest", distance = "logit")
+matched_data <- match.data(matched_data)
+lm_model_matched <- lm(thalach ~ num, data = matched_data)
+summary(lm_model_matched)
 
-filtered_r <- r[abs(r$cor) > 0.1,]
-r_del <- r[abs(r$cor) <= 0.1,]
-
-#filtered_r_p <- filtered_r[filtered_r$p <= 0.05,]
-del_r_p <- filtered_r[filtered_r$p > 0.05,]
-
-filtered_r <- subset(filtered_r, !(X == "slope" & Y == "cp"))
-filtered_r <- subset(filtered_r, !(X == "slope" & Y == "exang"))
-filtered_r <- subset(filtered_r, !(X == "trestbps" & Y == "restecg"))
-filtered_r <- subset(filtered_r, !(X == "fbs" & Y == "slope"))
-
-length(filtered_r$X)
-length(r_del$X)
-
-filtered_r.dagitty <- paste(filtered_r$X, filtered_r$A, filtered_r$Y, "[beta=",signif(filtered_r$cor,2),"] ", collapse="\n")
-g_with_coefficients <- dagitty( filtered_r.dagitty )
-coordinates(g_with_coefficients ) <- coordinates( g )
-plot(g_with_coefficients, show.coefficients=TRUE )
-
-##sex -> num hypothesis
-adjustmentSets(g_with_coefficients,"sex","num")
-#coef(glm(num ~ sex, df, family="binomial" ))
-model <- glm(num ~ sex, data = df, family = "binomial")
-summary(model)
-exp(coef(model))
+#With Confounders PSM (Structure Learned)
+ps_model <- glm(num ~ age + chol, data = df, family = binomial(link = "logit"))
+df$propensity_score <- predict(ps_model, type = "response")
+matched_data <- matchit(num ~ age + chol, data = df, method = "nearest", distance = "logit")
+matched_data <- match.data(matched_data)
+lm_model_matched <- lm(thalach ~ num + age + chol, data = matched_data)
+summary(lm_model_matched)
 
 
-adjustmentSets(g_with_coefficients,"num","cp")
-#model2 <- glm(cp ~ num + trestbps, data = df, family = "multinom")
-model2 <- multinom(cp ~ num + trestbps, data = df)
-summary(model2)
-exp(coef(model2))
-
-model_cp_trestbps <- multinom(cp ~ num + trestbps, data = df)
-model_cp_age <- multinom(cp ~ num + age, data = df)
-
-
-predicted_probs_trestbps <- predict(model_cp_trestbps, type = "probs")
-
-#asymptimatic
-df_new = df
-df_new$predicted_asymptomatic <- predicted_probs_trestbps[, "asymptomatic"]
-df_hd <- df_new[df_new$num == "Heart Disease", ]
-
-mean_asymptomatic_prob <- mean(df_hd$predicted_asymptomatic)
-cat("P(cp = asymptomatic | num = Heart Disease, adjusted for trestbps):", mean_asymptomatic_prob)
-
-#atypical anginna
-df_new = df
-df_new$predicted_atypical <- predicted_probs_trestbps[, "atypical angina"]
-df_hd <- df_new[df_new$num == "Heart Disease", ]
-
-mean_atypical_prob <- mean(df_hd$predicted_atypical)
-cat("P(cp = atypical | num = Heart Disease, adjusted for trestbps):", mean_atypical_prob)
-
-
-#typical angina
-df_new = df
-df_new$predicted_typical <- predicted_probs_trestbps[, "typical angina"]
-df_hd <- df_new[df_new$num == "Heart Disease", ]
-
-mean_typical_prob <- mean(df_hd$predicted_typical)
-cat("P(cp = typical | num = Heart Disease, adjusted for trestbps):", mean_typical_prob)
-
-#non-anginal pain
-df_new = df
-df_new$predicted_non_anginal <- predicted_probs_trestbps[, "non-anginal pain"]
-df_hd <- df_new[df_new$num == "Heart Disease", ]
-
-mean_non_anginal_prob <- mean(df_hd$predicted_non_anginal)
-cat("P(cp = non_anginal | num = Heart Disease, adjusted for trestbps):", mean_non_anginal_prob)
-
-mean_non_anginal_prob + mean_typical_prob + mean_atypical_prob + mean_asymptomatic_prob
 
 
